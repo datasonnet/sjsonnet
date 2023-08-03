@@ -6,8 +6,7 @@ package sjsonnet
  * - 80f58d4e2d5e4d4ea94ef828962ef5d8cba1a625: implements support for safe select operator ?.
  */
 
-import java.util.BitSet
-
+import java.util.{Arrays, BitSet}
 import scala.collection.mutable
 
 /**
@@ -124,6 +123,11 @@ object Expr{
   case class AssertExpr(pos: Position, asserted: Member.AssertStmt, returned: Expr) extends Expr
   case class LocalExpr(pos: Position, bindings: Array[Bind], returned: Expr) extends Expr {
     override def toString = s"LocalExpr($pos, ${arrStr(bindings)}, $returned)"
+    override def equals(o: Any): Boolean = o match {
+      case o: LocalExpr =>
+        pos == o.pos && Arrays.equals(bindings.asInstanceOf[Array[AnyRef]], o.bindings.asInstanceOf[Array[AnyRef]]) && returned == o.returned
+      case _ => false
+    }
   }
 
   case class Bind(pos: Position, name: String, args: Params, rhs: Expr) extends Member
@@ -169,6 +173,7 @@ object Expr{
                        preLocals: Array[Bind],
                        key: Expr,
                        value: Expr,
+                       plus: Boolean,
                        postLocals: Array[Bind],
                        first: ForSpec,
                        rest: List[CompSpec]) extends ObjBody {

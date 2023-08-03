@@ -22,7 +22,7 @@ import scala.collection.mutable
   * `parseCache`.
   */
 class Evaluator(resolver: CachedResolver,
-                val extVars: Map[String, ujson.Value],
+                val extVars: String => Option[Expr],
                 val wd: Path,
                 val settings: Settings,
                 warnLogger: Error => Unit = null) extends EvalScope {
@@ -155,13 +155,12 @@ class Evaluator(resolver: CachedResolver,
   }
 
   def visitError(e: Expr.Error)(implicit scope: ValScope): Nothing = {
-    Error.fail(
-      visitExpr(e.value) match {
-        case Val.Str(_, s) => s
-        case r => Materializer.stringify(r)
-      },
-      e.pos
-    )
+    Error.fail(materializeError(visitExpr(e.value)), e.pos)
+  }
+
+  private def materializeError(value: Val) = value match {
+    case Val.Str(_, s) => s
+    case r => Materializer.stringify(r)
   }
 
   def visitUnaryOp(e: UnaryOp)(implicit scope: ValScope): Val = {
@@ -250,7 +249,7 @@ class Evaluator(resolver: CachedResolver,
       e.asserted.msg match {
         case null => Error.fail("Assertion failed", e)
         case msg =>
-          Error.fail("Assertion failed: " + visitExpr(msg).cast[Val.Str].value, e)
+          Error.fail("Assertion failed: " + materializeError(visitExpr(msg)), e)
       }
     }
     visitExpr(e.returned)
@@ -259,15 +258,28 @@ class Evaluator(resolver: CachedResolver,
   private def visitSlice(e: Slice)(implicit scope: ValScope): Val = {
     visitExpr(e.value) match {
       case a: Val.Arr =>
-        a.slice(e.start.fold(0)(visitExpr(_).cast[Val.Num].value.toInt),
-          e.end.fold(a.length)(visitExpr(_).cast[Val.Num].value.toInt),
-          e.stride.fold(1)(visitExpr(_).cast[Val.Num].value.toInt))
-      case Val.Str(_, s) =>
-        val range =
-          e.start.fold(0)(visitExpr(_).cast[Val.Num].value.toInt) until
-            e.end.fold(s.length)(visitExpr(_).cast[Val.Num].value.toInt) by
+        new Val.Arr(
+          e.pos,
+          Util.sliceArr(
+            a.asLazyArray,
+            e.start.fold(0)(visitExpr(_).cast[Val.Num].value.toInt),
+            e.end.fold(a.length)(visitExpr(_).cast[Val.Num].value.toInt),
             e.stride.fold(1)(visitExpr(_).cast[Val.Num].value.toInt)
-        Val.Str(e.pos, range.dropWhile(_ < 0).takeWhile(_ < s.length).map(s).mkString)
+          )
+        )
+
+
+      case Val.Str(_, s) =>
+        Val.Str(
+          e.pos,
+          Util.sliceStr(
+            s,
+            e.start.fold(0)(visitExpr(_).cast[Val.Num].value.toInt),
+            e.end.fold(s.length)(visitExpr(_).cast[Val.Num].value.toInt),
+            e.stride.fold(1)(visitExpr(_).cast[Val.Num].value.toInt)
+          )
+        )
+
       case x => Error.fail("Can only slice array or string, not " + x.prettyName, e.pos)
     }
   }
@@ -516,8 +528,22 @@ class Evaluator(resolver: CachedResolver,
       } else createNewScope(self, sup)
     }
 
-    def assertions(self: Val.Obj): Unit = if (!asserting) {
-      asserting = true
+    def assertions(self: Val.Obj): Unit = if (
+      // We need to avoid asserting the same object more than once to prevent
+      // infinite recursion, but the previous implementation had the `asserting`
+      // flag kept under the object's *instantiation* rather than under the
+      // object itself. That means that objects that are instantiated once then
+      // extended multiple times would only trigger the assertions once, rather
+      // than once per extension.
+      //
+      // Due to backwards compatibility concerns, this fix has to go in under
+      // the flag `strictInheritedAssertions`, to be removed after an appropriate
+      // time period has passed.
+      (settings.strictInheritedAssertions && !self.asserting) ||
+      (!settings.strictInheritedAssertions && !asserting)
+    ) {
+      if (settings.strictInheritedAssertions) self.asserting = true
+      else asserting = true
       val newScope: ValScope = makeNewScope(self, self.getSuper)
       var i = 0
       while(i < asserts.length) {
@@ -604,12 +630,16 @@ class Evaluator(resolver: CachedResolver,
 
         visitExpr(e.key)(s) match {
           case Val.Str(_, k) =>
-            builder.put(k, new Val.Obj.Member(false, Visibility.Normal) {
+            val prev_length = builder.size()
+            builder.put(k, new Val.Obj.Member(e.plus, Visibility.Normal) {
               def invoke(self: Val.Obj, sup: Val.Obj, fs: FileScope, ev: EvalScope): Val =
                 visitExpr(e.value)(
                   s.extend(newBindings, self, null)
                 )
             })
+            if (prev_length == builder.size() && settings.noDuplicateKeysInComprehension) {
+              Error.fail(s"Duplicate key ${k} in evaluated object comprehension.", e.pos);
+            }
           case Val.Null(_) => // do nothing
         }
       }
