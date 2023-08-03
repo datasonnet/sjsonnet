@@ -18,7 +18,7 @@ import scala.util.matching.Regex
   * in Scala code. Uses `builtin` and other helpers to handle the common wrapper
   * logic automatically
   */
-object Std {
+class Std {
   private val dummyPos: Position = new Position(null, 0)
   private val emptyLazyArray = new Array[Lazy](0)
 
@@ -151,24 +151,47 @@ object Std {
   private object Foldl extends Val.Builtin3("func", "arr", "init") {
     def evalRhs(_func: Val, arr: Val, init: Val, ev: EvalScope, pos: Position): Val = {
       val func = _func.asFunc
-      var current = init
-      for(item <- arr.asArr.asLazyArray){
-        val c = current
-        current = func.apply2(c, item, pos.noOffset)(ev)
+      arr match{
+        case arr: Val.Arr =>
+          var current = init
+          for (item <- arr.asLazyArray) {
+            val c = current
+            current = func.apply2(c, item, pos.noOffset)(ev)
+          }
+          current
+
+        case s: Val.Str =>
+          var current = init
+          for (char <- s.value) {
+            val c = current
+            current = func.apply2(c, Val.Str(pos, new String(Array(char))), pos.noOffset)(ev)
+          }
+          current
       }
-      current
+
+
     }
   }
 
   private object Foldr extends Val.Builtin3("func", "arr", "init") {
     def evalRhs(_func: Val, arr: Val, init: Val, ev: EvalScope, pos: Position): Val = {
       val func = _func.asFunc
-      var current = init
-      for(item <- arr.asArr.asLazyArray.reverse){
-        val c = current
-        current = func.apply2(item, c, pos.noOffset)(ev)
+      arr match {
+        case arr: Val.Arr =>
+          var current = init
+          for (item <- arr.asLazyArray.reverse) {
+            val c = current
+            current = func.apply2(item, c, pos.noOffset)(ev)
+          }
+          current
+        case s: Val.Str =>
+          var current = init
+          for (char <- s.value) {
+            val c = current
+            current = func.apply2(Val.Str(pos, new String(Array(char))), c, pos.noOffset)(ev)
+          }
+          current
       }
-      current
     }
   }
 
@@ -441,6 +464,11 @@ object Std {
       new Val.Arr(pos, out.toArray)
     }
   }
+  private object Reverse extends Val.Builtin1("arrs") {
+    def evalRhs(arrs: Val, ev: EvalScope, pos: Position): Val = {
+      new Val.Arr(pos, arrs.asArr.asLazyArray.reverse)
+    }
+  }
 
   private object Split extends Val.Builtin2("str", "c") {
     def evalRhs(_str: Val, _c: Val, ev: EvalScope, pos: Position): Val = {
@@ -515,10 +543,7 @@ object Std {
   private object ExtVar extends Val.Builtin1("x") {
     def evalRhs(_x: Val, ev: EvalScope, pos: Position): Val = {
       val Val.Str(_, x) = _x
-      Materializer.reverse(
-        pos,
-        ev.extVars.getOrElse(x, Error.fail("Unknown extVar: " + x))
-      )
+      ev.visitExpr(ev.extVars(x).getOrElse(Error.fail("Unknown extVar: " + x)))(ValScope.empty)
     }
     override def staticSafe = false
   }
@@ -567,6 +592,11 @@ object Std {
   private object ManifestJson extends Val.Builtin1("v") {
     def evalRhs(v: Val, ev: EvalScope, pos: Position): Val =
       Val.Str(pos, Materializer.apply0(v, new MaterializeJsonRenderer())(ev).toString)
+  }
+
+  private object ManifestJsonMinified extends Val.Builtin1("v") {
+    def evalRhs(v: Val, ev: EvalScope, pos: Position): Val =
+      Val.Str(pos, Materializer.apply0(v, new MaterializeJsonRenderer(indent = -1))(ev).toString)
   }
 
   private object ManifestJsonEx extends Val.Builtin2("value", "indent") {
@@ -742,6 +772,14 @@ object Std {
     builtin("clamp", "x", "minVal", "maxVal"){ (pos, ev, x: Double, minVal: Double, maxVal: Double) =>
       math.max(minVal, math.min(x, maxVal))
     },
+    builtin("slice", "indexable", "index", "end", "step"){ (pos, ev, indexable: Val, index: Int, end: Int, step: Int) =>
+      val res = indexable match {
+        case Val.Str(pos0, s) => Val.Str(pos, Util.sliceStr(s, index, end, step))
+        case arr: Val.Arr => new Val.Arr(pos, Util.sliceArr(arr.asLazyArray, index, end, step))
+        case _ => Error.fail("std.slice first argument must be indexable")
+      }
+      res: Val
+    },
 
     builtin("makeArray", "sz", "func"){ (pos, ev, sz: Int, func: Val.Func) =>
       new Val.Arr(
@@ -913,6 +951,7 @@ object Std {
     },
 
     "flattenArrays" -> FlattenArrays,
+    "reverse" -> Reverse,
 
     builtin("manifestIni", "v"){ (pos, ev, v: Val) =>
       val materialized = Materializer(v)(ev)
@@ -950,6 +989,7 @@ object Std {
       Materializer.apply0(v, new PythonRenderer())(ev).toString
     },
     "manifestJson" -> ManifestJson,
+    "manifestJsonMinified" -> ManifestJsonMinified,
     "manifestJsonEx" -> ManifestJsonEx,
     builtinWithDefaults("manifestYamlDoc",
                         "v" -> null,
@@ -1000,6 +1040,12 @@ object Std {
             tag(t)(
               attrs.value.map {
                 case (k, ujson.Str(v)) => attr(k) := v
+
+                // use ujson.write to make sure output number format is same as
+                // google/jsonnet, e.g. whole numbers are printed without the
+                // decimal point and trailing zero
+                case (k, ujson.Num(v)) => attr(k) := ujson.write(v)
+
                 case (k, v) => Error.fail("Cannot call manifestXmlJsonml on " + v.getClass)
               }.toSeq,
               children.map(rec)
@@ -1217,6 +1263,21 @@ object Std {
         val v2: T2 = implicitly[ReadWriter[T2]].apply(arg2)
         val v3: T3 = implicitly[ReadWriter[T3]].apply(arg3)
         implicitly[ReadWriter[R]].write(outerPos, eval(outerPos, ev, v1, v2, v3))
+      }
+    })
+  }
+
+  def builtin[R: ReadWriter, T1: ReadWriter, T2: ReadWriter, T3: ReadWriter, T4: ReadWriter]
+             (name: String, p1: String, p2: String, p3: String, p4: String)
+             (eval: (Position, EvalScope, T1, T2, T3, T4) => R): (String, Val.Func) = {
+    (name, new Val.Builtin4(p1, p2, p3, p4) {
+      def evalRhs(arg1: Val, arg2: Val, arg3: Val, arg4: Val, ev: EvalScope, outerPos: Position): Val = {
+        //println("--- calling builtin: "+name)
+        val v1: T1 = implicitly[ReadWriter[T1]].apply(arg1)
+        val v2: T2 = implicitly[ReadWriter[T2]].apply(arg2)
+        val v3: T3 = implicitly[ReadWriter[T3]].apply(arg3)
+        val v4: T4 = implicitly[ReadWriter[T4]].apply(arg4)
+        implicitly[ReadWriter[R]].write(outerPos, eval(outerPos, ev, v1, v2, v3, v4))
       }
     })
   }

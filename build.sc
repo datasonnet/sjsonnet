@@ -1,5 +1,5 @@
 import mill._, scalalib._, publish._, scalajslib._, scalanativelib._, scalanativelib.api._
-val sjsonnetVersion = "0.4.3-SNAPSHOT"
+val sjsonnetVersion = "0.4.5"
 
 object sjsonnet extends Cross[SjsonnetModule]("2.12.17", "2.13.10")
 class SjsonnetModule(val crossScalaVersion: String) extends Module {

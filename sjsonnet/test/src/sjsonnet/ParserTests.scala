@@ -4,8 +4,8 @@ import Expr._
 import fastparse.Parsed
 import Val.{True, Num}
 object ParserTests extends TestSuite{
-  def parse(s: String) = fastparse.parse(s, new Parser(null).document(_)).get.value._1
-  def parseErr(s: String) = fastparse.parse(s, new Parser(null).document(_), verboseFailures = true).asInstanceOf[Parsed.Failure].msg
+  def parse(s: String, strictImportSyntax: Boolean = false) = fastparse.parse(s, new Parser(null, strictImportSyntax).document(_)).get.value._1
+  def parseErr(s: String, strictImportSyntax: Boolean = false) = fastparse.parse(s, new Parser(null, strictImportSyntax).document(_), verboseFailures = true).asInstanceOf[Parsed.Failure].msg
   val dummyFS = new FileScope(null)
   def pos(i: Int) = new Position(dummyFS, i)
   def tests = Tests{
@@ -26,6 +26,28 @@ object ParserTests extends TestSuite{
     }
     test("givenDuplicateFieldsInListComprehension_expectError") {
       parseErr("""{ ["bar"]: x for x in [1, 2]}""") ==> """Expected no duplicate field: "bar" :1:29, found "}""""
+    }
+
+    test("computedImports") {
+      parse("""local foo = import "foo"; 0""") ==>
+        LocalExpr(pos(6), Array(Bind(pos(6), "foo", null, Import(pos(12), "foo"))), Num(pos(26),0.0))
+      parse("""local foo = (import "foo") + bar; 0""") ==>
+        LocalExpr(pos(6), Array(Bind(pos(6), "foo", null, BinaryOp(pos(27), Import(pos(13), "foo"), 3, Id(pos(29), "bar")))), Num(pos(34),0.0))
+
+      parse("""import "foo".bar""", strictImportSyntax = false) ==> Select(pos(12),Import(pos(0),"foo"), "bar")
+      parse("""import "foo"[1]""", strictImportSyntax = false) ==> Lookup(pos(12),Import(pos(0), "foo"), Num(pos(13), 1))
+
+      parseErr("""import "foo".bar""", strictImportSyntax = true)
+      parseErr("""import "foo"[1]""", strictImportSyntax = true)
+
+      parseErr("""local foo = import ("foo" + bar); 0""", strictImportSyntax = true) ==>
+        """Expected string literal (computed imports are not allowed):1:33, found "; 0""""
+      parseErr("""local foo = import "foo" + bar; 0""", strictImportSyntax = true) ==>
+        """Expected string literal (computed imports are not allowed):1:31, found "; 0""""
+    }
+
+    test("id starts with number") {
+      parseErr("""{1_n: "foo",}""") ==> """Expected "}":1:2, found "1_n: \"foo\"""""
     }
   }
 }

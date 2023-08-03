@@ -6,7 +6,7 @@ import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 
 class ProfilingEvaluator(resolver: CachedResolver,
-                         extVars: Map[String, ujson.Value],
+                         extVars: String => Option[Expr],
                          wd: Path,
                          settings: Settings,
                          warn: Error => Unit)
@@ -154,7 +154,7 @@ class ProfilingEvaluator(resolver: CachedResolver,
 
   def builtins(): Seq[BuiltinBox] = {
     val names = new util.IdentityHashMap[Val.Func, String]()
-    Std.functions.foreachEntry((n, f) => names.put(f, n))
+    new Std().functions.foreachEntry((n, f) => names.put(f, n))
     val m = new mutable.HashMap[String, BuiltinBox]
     def add(b: ExprBox, func: Val.Builtin): Unit = {
       val n = names.getOrDefault(func, func.getClass.getName)

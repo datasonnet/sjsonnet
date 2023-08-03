@@ -1,17 +1,10 @@
 package sjsonnet
 
 import utest._
-import TestUtils.eval
+import TestUtils.{eval, evalErr}
 object EvaluatorTests extends TestSuite{
 
-  def evalErr(s: String, strict: Boolean = false) = {
-    try {
-      val x = eval(s, strict = strict)
-      throw new Exception (s"Expected exception, got result: $x")
-    }catch{case e: Exception =>
-      e.getMessage.split('\n').map(_.trim).mkString("\n") // normalize inconsistent indenation on JVM vs JS
-    }
-  }
+
   def tests = Tests{
     test("arithmetic") {
       eval("1 + 2 + 3") ==> ujson.Num(6)
@@ -325,13 +318,13 @@ object EvaluatorTests extends TestSuite{
       eval("'%#-0- + 5.5f' % -123.456") ==> ujson.Str("-123.45600")
     }
     test("strict") {
-      eval("({ a: 1 } { b: 2 }).a", false) ==> ujson.Num(1)
-      evalErr("({ a: 1 } { b: 2 }).a", true) ==>
+      eval("({ a: 1 } { b: 2 }).a", strict = false) ==> ujson.Num(1)
+      evalErr("({ a: 1 } { b: 2 }).a", strict = true) ==>
         """sjsonnet.StaticError: Adjacent object literals not allowed in strict mode - Use '+' to concatenate objects
           |at [ObjExtend].(:1:11)""".stripMargin
-      eval("local x = { c: 3 }; (x { a: 1 } { b: 2 }).a", false) ==> ujson.Num(1)
-      eval("local x = { c: 3 }; (x { a: 1 }).a", true) ==> ujson.Num(1)
-      evalErr("local x = { c: 3 }; ({ a: 1 } { b: 2 }).a", true) ==>
+      eval("local x = { c: 3 }; (x { a: 1 } { b: 2 }).a", strict = false) ==> ujson.Num(1)
+      eval("local x = { c: 3 }; (x { a: 1 }).a", strict = true) ==> ujson.Num(1)
+      evalErr("local x = { c: 3 }; ({ a: 1 } { b: 2 }).a", strict = true) ==>
         """sjsonnet.StaticError: Adjacent object literals not allowed in strict mode - Use '+' to concatenate objects
           |at [ObjExtend].(:1:31)""".stripMargin
     }
@@ -341,6 +334,7 @@ object EvaluatorTests extends TestSuite{
 
       eval("{ ['foo']+: x for x in  []}", false) ==> ujson.Obj()
       eval("{ ['foo']+: x for x in  [1]}", false) ==> ujson.Obj("foo" -> 1)
+      eval("{ ['foo']+: [x] for x in [1]} + { ['foo']+: [x] for x in [2]}", false) ==> ujson.Obj("foo" -> ujson.Arr(1,2))
     }
     test("givenNoDuplicateFieldsInListComprehension1_expectSuccess") {
       eval("""{ ["bar"]: x for x in [-876.89]}""") ==> ujson.Obj("bar" -> -876.89)
@@ -348,9 +342,74 @@ object EvaluatorTests extends TestSuite{
     test("givenNoDuplicateFieldsInListComprehension2_expectSuccess") {
       eval("""{ ["bar_" + x]: x for x in [5,12]}""") ==> ujson.Obj("bar_5" -> 5, "bar_12" -> 12)
     }
+    test("givenDuplicateFieldsInListComprehension_expectFailure") {
+      evalErr("""{ [x]: x for x in ["A", "A"]}""", noDuplicateKeysInComprehension = true) ==>
+        """sjsonnet.Error: Duplicate key A in evaluated object comprehension.
+          |at .(:1:3)""".stripMargin
+    }
+    test("givenDuplicateFieldsInListComprehension_noflag_expectSuccess") {
+      eval("""{ [x]: x for x in ["A", "A"]}""", noDuplicateKeysInComprehension = false) ==>
+        ujson.Obj("A" -> "A")
+    }
+    test("givenDuplicateFieldsInIndirectListComprehension_expectFailure") {
+      evalErr(
+        """local y = { a: "A" };
+          |local z = { a: "A" };
+          |{ [x.a]: x for x in [y, z]}""".stripMargin,
+         noDuplicateKeysInComprehension = true
+      ) ==>
+        """sjsonnet.Error: Duplicate key A in evaluated object comprehension.
+          |at .(:3:3)""".stripMargin
+    }
+    test("givenDuplicateFieldsInIndirectListComprehension_noflag_expectSuccess") {
+      eval(
+        """local y = { a: "A" };
+          |local z = { a: "A", "b": "B" };
+          |{ [x.a]: x for x in [y, z]}""".stripMargin,
+         noDuplicateKeysInComprehension = false
+      ) ==>
+        ujson.Obj("A" -> ujson.Obj("a" -> "A", "b" -> "B"))
+    }
     test("functionEqualsNull") {
       eval("""local f(x)=null; f == null""") ==> ujson.False
       eval("""local f=null; f == null""") ==> ujson.True
+    }
+
+    test("identifierStartsWithKeyword") {
+      for(keyword <- Parser.keywords){
+        eval(s"""local ${keyword}Foo = 123; ${keyword}Foo""") ==> ujson.Num(123)
+        eval(s"""{${keyword}Foo: 123}""") ==> ujson.Obj(s"${keyword}Foo" -> ujson.Num(123))
+      }
+    }
+
+    test("errorNonString") {
+      assert(evalErr("""error {a: "b"}""").contains("""{"a": "b"}"""))
+      assert(evalErr("""assert 1 == 2 : { a: "b"}; 1""").contains("""{"a": "b"}"""))
+    }
+
+    test("assertInheritance"){
+      test - assert(evalErr("""{ } + {assert false}""").contains("sjsonnet.Error: Assertion failed"))
+      test - assert(evalErr("""{assert false} + {}""").contains("sjsonnet.Error: Assertion failed"))
+      test - assert(evalErr("""{assert false} + {} + {}""").contains("sjsonnet.Error: Assertion failed"))
+      test - assert(evalErr("""{} + {assert false} + {}""").contains("sjsonnet.Error: Assertion failed"))
+      test - assert(evalErr("""{} + {} + {assert false}""").contains("sjsonnet.Error: Assertion failed"))
+      test - {
+        val problematicStrictInheritedAssertionsSnippet =
+          """local template = { assert self.flag };
+            |{ a: template { flag: true, }, b: template { flag: false, } }
+            |""".stripMargin
+        assert(
+          evalErr(
+            problematicStrictInheritedAssertionsSnippet,
+            strictInheritedAssertions = true
+          ).contains("sjsonnet.Error: Assertion failed")
+        )
+
+        assert(
+          eval(problematicStrictInheritedAssertionsSnippet, strictInheritedAssertions = false) ==
+          ujson.Obj("a" -> ujson.Obj("flag" -> true), "b" -> ujson.Obj("flag" -> false))
+        )
+      }
     }
   }
 }
